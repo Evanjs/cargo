@@ -5,7 +5,7 @@ use std::io::prelude::*;
 
 use cargo_test_support::cross_compile;
 use cargo_test_support::git;
-use cargo_test_support::registry::{registry_path, registry_url, Package};
+use cargo_test_support::registry::{self, registry_path, registry_url, Package};
 use cargo_test_support::{
     basic_manifest, cargo_process, no_such_file_err_msg, project, symlink_supported, t,
 };
@@ -13,7 +13,7 @@ use cargo_test_support::{
 use cargo_test_support::install::{
     assert_has_installed_exe, assert_has_not_installed_exe, cargo_home,
 };
-use cargo_test_support::paths;
+use cargo_test_support::paths::{self, CargoPathExt};
 use std::env;
 use std::path::PathBuf;
 
@@ -400,6 +400,23 @@ fn install_target_dir() {
 }
 
 #[cargo_test]
+#[cfg(target_os = "linux")]
+fn install_path_with_lowercase_cargo_toml() {
+    let toml = paths::root().join("cargo.toml");
+    fs::write(toml, "").unwrap();
+
+    cargo_process("install --path .")
+        .with_status(101)
+        .with_stderr(
+            "\
+[ERROR] `[CWD]` does not contain a Cargo.toml file, \
+but found cargo.toml please try to rename it to Cargo.toml. --path must point to a directory containing a Cargo.toml file.
+",
+        )
+        .run();
+}
+
+#[cargo_test]
 fn multiple_crates_error() {
     let p = git::repo(&paths::root().join("foo"))
         .file("Cargo.toml", &basic_manifest("foo", "0.1.0"))
@@ -414,7 +431,9 @@ fn multiple_crates_error() {
         .with_stderr(
             "\
 [UPDATING] git repository [..]
-[ERROR] multiple packages with binaries found: bar, foo
+[ERROR] multiple packages with binaries found: bar, foo. \
+When installing a git repository, cargo will always search the entire repo for any Cargo.toml. \
+Please specify which to install.
 ",
         )
         .run();
@@ -723,9 +742,7 @@ fn compile_failure() {
     found at `[..]target`
 
 Caused by:
-  could not compile `foo`
-
-To learn more, run the command again with --verbose.
+  could not compile `foo` due to previous error
 ",
         )
         .run();
@@ -756,6 +773,26 @@ fn git_repo() {
         .run();
     assert_has_installed_exe(cargo_home(), "foo");
     assert_has_installed_exe(cargo_home(), "foo");
+}
+
+#[cargo_test]
+#[cfg(target_os = "linux")]
+fn git_repo_with_lowercase_cargo_toml() {
+    let p = git::repo(&paths::root().join("foo"))
+        .file("cargo.toml", &basic_manifest("foo", "0.1.0"))
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    cargo_process("install --git")
+        .arg(p.url().to_string())
+        .with_status(101)
+        .with_stderr(
+            "\
+[UPDATING] git repository [..]
+[ERROR] Could not find Cargo.toml in `[..]`, but found cargo.toml please try to rename it to Cargo.toml
+",
+        )
+        .run();
 }
 
 #[cargo_test]
@@ -1737,5 +1774,62 @@ fn locked_install_without_published_lockfile() {
 
     cargo_process("install foo --locked")
         .with_stderr_contains("[WARNING] no Cargo.lock file published in foo v0.1.0")
+        .run();
+}
+
+#[cargo_test]
+fn install_semver_metadata() {
+    // Check trying to install a package that uses semver metadata.
+    // This uses alt registry because the bug this is exercising doesn't
+    // trigger with a replaced source.
+    registry::alt_init();
+    Package::new("foo", "1.0.0+abc")
+        .alternative(true)
+        .file("src/main.rs", "fn main() {}")
+        .publish();
+
+    cargo_process("install foo --registry alternative --version 1.0.0+abc").run();
+    cargo_process("install foo --registry alternative")
+        .with_stderr("\
+[UPDATING] `[ROOT]/alternative-registry` index
+[IGNORED] package `foo v1.0.0+abc (registry `[ROOT]/alternative-registry`)` is already installed, use --force to override
+[WARNING] be sure to add [..]
+")
+        .run();
+    // "Updating" is not displayed here due to the --version fast-path.
+    cargo_process("install foo --registry alternative --version 1.0.0+abc")
+        .with_stderr("\
+[IGNORED] package `foo v1.0.0+abc (registry `[ROOT]/alternative-registry`)` is already installed, use --force to override
+[WARNING] be sure to add [..]
+")
+        .run();
+    cargo_process("install foo --registry alternative --version 1.0.0 --force")
+        .with_stderr(
+            "\
+[UPDATING] `[ROOT]/alternative-registry` index
+[INSTALLING] foo v1.0.0+abc (registry `[ROOT]/alternative-registry`)
+[COMPILING] foo v1.0.0+abc (registry `[ROOT]/alternative-registry`)
+[FINISHED] [..]
+[REPLACING] [ROOT]/home/.cargo/bin/foo[EXE]
+[REPLACED] package [..]
+[WARNING] be sure to add [..]
+",
+        )
+        .run();
+    // Check that from a fresh cache will work without metadata, too.
+    paths::home().join(".cargo/registry").rm_rf();
+    paths::home().join(".cargo/bin").rm_rf();
+    cargo_process("install foo --registry alternative --version 1.0.0")
+        .with_stderr("\
+[UPDATING] `[ROOT]/alternative-registry` index
+[DOWNLOADING] crates ...
+[DOWNLOADED] foo v1.0.0+abc (registry `[ROOT]/alternative-registry`)
+[INSTALLING] foo v1.0.0+abc (registry `[ROOT]/alternative-registry`)
+[COMPILING] foo v1.0.0+abc (registry `[ROOT]/alternative-registry`)
+[FINISHED] [..]
+[INSTALLING] [ROOT]/home/.cargo/bin/foo[EXE]
+[INSTALLED] package `foo v1.0.0+abc (registry `[ROOT]/alternative-registry`)` (executable `foo[EXE]`)
+[WARNING] be sure to add [..]
+")
         .run();
 }

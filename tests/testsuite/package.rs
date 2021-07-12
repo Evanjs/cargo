@@ -287,8 +287,47 @@ fn path_dependency_no_version() {
             "\
 [WARNING] manifest has no documentation, homepage or repository.
 See https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info.
-[ERROR] all path dependencies must have a version specified when packaging.
-dependency `bar` does not specify a version.
+[ERROR] all dependencies must have a version specified when packaging.
+dependency `bar` does not specify a version\n\
+Note: The packaged dependency will use the version from crates.io,
+the `path` specification will be removed from the dependency declaration.
+",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn git_dependency_no_version() {
+    registry::init();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license = "MIT"
+                description = "foo"
+
+                [dependencies.foo]
+                git = "git://path/to/nowhere"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("package")
+        .with_status(101)
+        .with_stderr(
+            "\
+[WARNING] manifest has no documentation, homepage or repository.
+See https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info.
+[ERROR] all dependencies must have a version specified when packaging.
+dependency `foo` does not specify a version
+Note: The packaged dependency will use the version from crates.io,
+the `git` specification will be removed from the dependency declaration.
 ",
         )
         .run();
@@ -811,6 +850,59 @@ committed into git:
 Cargo.toml
 
 to proceed despite this and include the uncommitted changes, pass the `--allow-dirty` flag
+",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn dirty_ignored() {
+    // Cargo warns about an ignored file that will be published.
+    let (p, repo) = git::new_repo("foo", |p| {
+        p.file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.1.0"
+                description = "foo"
+                license = "foo"
+                documentation = "foo"
+                include = ["src", "build"]
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file(".gitignore", "build")
+    });
+    // Example of adding a file that is confusingly ignored by an overzealous
+    // gitignore rule.
+    p.change_file("src/build/mod.rs", "");
+    p.cargo("package --list")
+        .with_status(101)
+        .with_stderr(
+            "\
+error: 1 files in the working directory contain changes that were not yet committed into git:
+
+src/build/mod.rs
+
+to proceed despite this and include the uncommitted changes, pass the `--allow-dirty` flag
+",
+        )
+        .run();
+    // Add the ignored file and make sure it is included.
+    let mut index = t!(repo.index());
+    t!(index.add_path(Path::new("src/build/mod.rs")));
+    t!(index.write());
+    git::commit(&repo);
+    p.cargo("package --list")
+        .with_stderr("")
+        .with_stdout(
+            "\
+.cargo_vcs_info.json
+Cargo.toml
+Cargo.toml.orig
+src/build/mod.rs
+src/lib.rs
 ",
         )
         .run();
@@ -1842,8 +1934,10 @@ src/main.rs
         .with_status(101)
         .with_stderr(
             "\
-error: all path dependencies must have a version specified when packaging.
-dependency `bar` does not specify a version.
+[ERROR] all dependencies must have a version specified when packaging.
+dependency `bar` does not specify a version
+Note: The packaged dependency will use the version from crates.io,
+the `path` specification will be removed from the dependency declaration.
 ",
         )
         .run();
@@ -1947,9 +2041,10 @@ fn reproducible_output() {
     let mut archive = Archive::new(decoder);
     for ent in archive.entries().unwrap() {
         let ent = ent.unwrap();
+        println!("checking {:?}", ent.path());
         let header = ent.header();
         assert_eq!(header.mode().unwrap(), 0o644);
-        assert_eq!(header.mtime().unwrap(), 0);
+        assert!(header.mtime().unwrap() != 0);
         assert_eq!(header.username().unwrap().unwrap(), "");
         assert_eq!(header.groupname().unwrap().unwrap(), "");
     }
@@ -1975,4 +2070,38 @@ fn package_with_resolver_and_metadata() {
         .build();
 
     p.cargo("package").run();
+}
+
+#[cargo_test]
+fn deleted_git_working_tree() {
+    // When deleting a file, but not staged, cargo should ignore the file.
+    let (p, repo) = git::new_repo("foo", |p| {
+        p.file("src/lib.rs", "").file("src/main.rs", "fn main() {}")
+    });
+    p.root().join("src/lib.rs").rm_rf();
+    p.cargo("package --allow-dirty --list")
+        .with_stdout(
+            "\
+Cargo.lock
+Cargo.toml
+Cargo.toml.orig
+src/main.rs
+",
+        )
+        .run();
+    p.cargo("package --allow-dirty").run();
+    let mut index = t!(repo.index());
+    t!(index.remove(Path::new("src/lib.rs"), 0));
+    t!(index.write());
+    p.cargo("package --allow-dirty --list")
+        .with_stdout(
+            "\
+Cargo.lock
+Cargo.toml
+Cargo.toml.orig
+src/main.rs
+",
+        )
+        .run();
+    p.cargo("package --allow-dirty").run();
 }

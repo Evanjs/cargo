@@ -22,7 +22,9 @@ is placed in `target/doc` in rustdoc's usual format.
 
 {{#option "`--open`" }}
 Open the docs in a browser after building them. This will use your default
-browser unless you define another one in the `BROWSER` environment variable.
+browser unless you define another one in the `BROWSER` environment variable
+or use the [`doc.browser`](../reference/config.html#docbrowser) configuration
+option.
 {{/option}}
 
 {{#option "`--no-deps`" }}
@@ -30,7 +32,7 @@ Do not build documentation for dependencies.
 {{/option}}
 
 {{#option "`--document-private-items`" }}
-Include non-public items in the documentation.
+Include non-public items in the documentation. This will be enabled by default if documenting a binary target.
 {{/option}}
 
 {{/options}}

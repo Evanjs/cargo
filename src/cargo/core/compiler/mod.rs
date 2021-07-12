@@ -62,29 +62,27 @@ use cargo_util::{paths, ProcessBuilder, ProcessError};
 
 const RUSTDOC_CRATE_VERSION_FLAG: &str = "--crate-version";
 
-#[derive(Copy, Clone, Hash, Debug, PartialEq, Eq)]
+#[derive(Clone, Hash, Debug, PartialEq, Eq)]
 pub enum LinkType {
+    All,
     Cdylib,
     Bin,
+    SingleBin(String),
     Test,
     Bench,
     Example,
 }
 
-impl From<&super::Target> for Option<LinkType> {
-    fn from(value: &super::Target) -> Self {
-        if value.is_cdylib() {
-            Some(LinkType::Cdylib)
-        } else if value.is_bin() {
-            Some(LinkType::Bin)
-        } else if value.is_test() {
-            Some(LinkType::Test)
-        } else if value.is_bench() {
-            Some(LinkType::Bench)
-        } else if value.is_exe_example() {
-            Some(LinkType::Example)
-        } else {
-            None
+impl LinkType {
+    pub fn applies_to(&self, target: &Target) -> bool {
+        match self {
+            LinkType::All => true,
+            LinkType::Cdylib => target.is_cdylib(),
+            LinkType::Bin => target.is_bin(),
+            LinkType::SingleBin(name) => target.is_bin() && target.name() == name,
+            LinkType::Test => target.is_test(),
+            LinkType::Bench => target.is_bench(),
+            LinkType::Example => target.is_exe_example(),
         }
     }
 }
@@ -227,11 +225,15 @@ fn rustc(cx: &mut Context<'_, '_>, unit: &Unit, exec: &Arc<dyn Executor>) -> Car
     // If we are a binary and the package also contains a library, then we
     // don't pass the `-l` flags.
     let pass_l_flag = unit.target.is_lib() || !unit.pkg.targets().iter().any(|t| t.is_lib());
-    let link_type = (&unit.target).into();
 
-    let dep_info_name = match cx.files().metadata(unit) {
-        Some(metadata) => format!("{}-{}.d", unit.target.crate_name(), metadata),
-        None => format!("{}.d", unit.target.crate_name()),
+    let dep_info_name = if cx.files().use_extra_filename(unit) {
+        format!(
+            "{}-{}.d",
+            unit.target.crate_name(),
+            cx.files().metadata(unit)
+        )
+    } else {
+        format!("{}.d", unit.target.crate_name())
     };
     let rustc_dep_info_loc = root.join(dep_info_name);
     let dep_info_loc = fingerprint::dep_info_loc(cx, unit);
@@ -275,7 +277,7 @@ fn rustc(cx: &mut Context<'_, '_>, unit: &Unit, exec: &Arc<dyn Executor>) -> Car
                     &script_outputs,
                     &build_scripts,
                     pass_l_flag,
-                    link_type,
+                    &target,
                     current_id,
                 )?;
                 add_plugin_deps(&mut rustc, &script_outputs, &build_scripts, &root_output)?;
@@ -331,7 +333,20 @@ fn rustc(cx: &mut Context<'_, '_>, unit: &Unit, exec: &Arc<dyn Executor>) -> Car
                 },
             )
             .map_err(verbose_if_simple_exit_code)
-            .with_context(|| format!("could not compile `{}`", name))?;
+            .with_context(|| {
+                // adapted from rustc_errors/src/lib.rs
+                let warnings = match output_options.warnings_seen {
+                    0 => String::new(),
+                    1 => "; 1 warning emitted".to_string(),
+                    count => format!("; {} warnings emitted", count),
+                };
+                let errors = match output_options.errors_seen {
+                    0 => String::new(),
+                    1 => " due to previous error".to_string(),
+                    count => format!(" due to {} previous errors", count),
+                };
+                format!("could not compile `{}`{}{}", name, errors, warnings)
+            })?;
         }
 
         if rustc_dep_info_loc.exists() {
@@ -366,7 +381,7 @@ fn rustc(cx: &mut Context<'_, '_>, unit: &Unit, exec: &Arc<dyn Executor>) -> Car
         build_script_outputs: &BuildScriptOutputs,
         build_scripts: &BuildScripts,
         pass_l_flag: bool,
-        link_type: Option<LinkType>,
+        target: &Target,
         current_id: PackageId,
     ) -> CargoResult<()> {
         for key in build_scripts.to_link.iter() {
@@ -391,11 +406,14 @@ fn rustc(cx: &mut Context<'_, '_>, unit: &Unit, exec: &Arc<dyn Executor>) -> Car
                 }
             }
 
-            if link_type.is_some() {
-                for (lt, arg) in &output.linker_args {
-                    if lt.is_none() || *lt == link_type {
-                        rustc.arg("-C").arg(format!("link-arg={}", arg));
-                    }
+            for (lt, arg) in &output.linker_args {
+                // There was an unintentional change where cdylibs were
+                // allowed to be passed via transitive dependencies. This
+                // clause should have been kept in the `if` block above. For
+                // now, continue allowing it for cdylib only.
+                // See https://github.com/rust-lang/cargo/issues/9562
+                if lt.applies_to(target) && (key.0 == current_id || *lt == LinkType::Cdylib) {
+                    rustc.arg("-C").arg(format!("link-arg={}", arg));
                 }
             }
         }
@@ -576,6 +594,11 @@ fn prepare_rustc(
         base.env("CARGO_PRIMARY_PACKAGE", "1");
     }
 
+    if unit.target.is_test() || unit.target.is_bench() {
+        let tmp = cx.files().layout(unit.kind).prepare_tmp()?;
+        base.env("CARGO_TARGET_TMPDIR", tmp.display().to_string());
+    }
+
     if cx.bcx.config.cli_unstable().jobserver_per_rustc {
         let client = cx.new_jobserver()?;
         base.inherit_jobserver(&client);
@@ -594,7 +617,8 @@ fn rustdoc(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<Work> {
     // script_metadata is not needed here, it is only for tests.
     let mut rustdoc = cx.compilation.rustdoc_process(unit, None)?;
     rustdoc.inherit_jobserver(&cx.jobserver);
-    rustdoc.arg("--crate-name").arg(&unit.target.crate_name());
+    let crate_name = unit.target.crate_name();
+    rustdoc.arg("--crate-name").arg(&crate_name);
     add_path_args(bcx.ws, unit, &mut rustdoc);
     add_cap_lints(bcx, unit, &mut rustdoc);
 
@@ -608,7 +632,7 @@ fn rustdoc(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<Work> {
     // it doesn't already exist.
     paths::create_dir_all(&doc_dir)?;
 
-    rustdoc.arg("-o").arg(doc_dir);
+    rustdoc.arg("-o").arg(&doc_dir);
 
     for feat in &unit.features {
         rustdoc.arg("--cfg").arg(&format!("feature=\"{}\"", feat));
@@ -647,6 +671,13 @@ fn rustdoc(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<Work> {
                     rustdoc.env(name, value);
                 }
             }
+        }
+        let crate_dir = doc_dir.join(&crate_name);
+        if crate_dir.exists() {
+            // Remove output from a previous build. This ensures that stale
+            // files for removed items are removed.
+            log::debug!("removing pre-existing doc directory {:?}", crate_dir);
+            paths::remove_dir_all(crate_dir)?;
         }
         state.running(&rustdoc);
 
@@ -881,15 +912,10 @@ fn build_base_args(
         cmd.arg("--cfg").arg(&format!("feature=\"{}\"", feat));
     }
 
-    match cx.files().metadata(unit) {
-        Some(m) => {
-            cmd.arg("-C").arg(&format!("metadata={}", m));
-            cmd.arg("-C").arg(&format!("extra-filename=-{}", m));
-        }
-        None => {
-            cmd.arg("-C")
-                .arg(&format!("metadata={}", cx.files().target_short_hash(unit)));
-        }
+    let meta = cx.files().metadata(unit);
+    cmd.arg("-C").arg(&format!("metadata={}", meta));
+    if cx.files().use_extra_filename(unit) {
+        cmd.arg("-C").arg(&format!("extra-filename=-{}", meta));
     }
 
     if rpath {
@@ -1148,6 +1174,8 @@ struct OutputOptions {
     /// Other types of messages are processed regardless
     /// of the value of this flag
     show_warnings: bool,
+    warnings_seen: usize,
+    errors_seen: usize,
 }
 
 impl OutputOptions {
@@ -1164,6 +1192,8 @@ impl OutputOptions {
             color,
             cache_cell,
             show_warnings: true,
+            warnings_seen: 0,
+            errors_seen: 0,
         }
     }
 }
@@ -1231,7 +1261,18 @@ fn on_stderr_line_inner(
         }
     };
 
+    let count_diagnostic = |level, options: &mut OutputOptions| {
+        if level == "warning" {
+            options.warnings_seen += 1;
+        } else if level == "error" {
+            options.errors_seen += 1;
+        }
+    };
+
     if let Ok(report) = serde_json::from_str::<FutureIncompatReport>(compiler_message.get()) {
+        for item in &report.future_incompat_report {
+            count_diagnostic(&*item.diagnostic.level, options);
+        }
         state.future_incompat_report(report.future_incompat_report);
         return Ok(true);
     }
@@ -1252,8 +1293,14 @@ fn on_stderr_line_inner(
             #[derive(serde::Deserialize)]
             struct CompilerMessage {
                 rendered: String,
+                message: String,
+                level: String,
             }
             if let Ok(mut error) = serde_json::from_str::<CompilerMessage>(compiler_message.get()) {
+                if error.level == "error" && error.message.starts_with("aborting due to") {
+                    // Skip this line; we'll print our own summary at the end.
+                    return Ok(true);
+                }
                 // state.stderr will add a newline
                 if error.rendered.ends_with('\n') {
                     error.rendered.pop();
@@ -1268,6 +1315,7 @@ fn on_stderr_line_inner(
                         .expect("strip should never fail")
                 };
                 if options.show_warnings {
+                    count_diagnostic(&error.level, options);
                     state.stderr(rendered)?;
                 }
                 return Ok(true);
@@ -1355,6 +1403,14 @@ fn on_stderr_line_inner(
         return Ok(true);
     }
 
+    #[derive(serde::Deserialize)]
+    struct CompilerMessage {
+        level: String,
+    }
+    if let Ok(message) = serde_json::from_str::<CompilerMessage>(compiler_message.get()) {
+        count_diagnostic(&message.level, options);
+    }
+
     let msg = machine_message::FromCompiler {
         package_id,
         manifest_path,
@@ -1386,6 +1442,8 @@ fn replay_output_cache(
         color,
         cache_cell: None,
         show_warnings,
+        warnings_seen: 0,
+        errors_seen: 0,
     };
     Work::new(move |state| {
         if !path.exists() {

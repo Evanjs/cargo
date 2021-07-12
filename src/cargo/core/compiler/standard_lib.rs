@@ -33,7 +33,7 @@ pub fn parse_unstable_flag(value: Option<&str>) -> Vec<String> {
 /// Resolve the standard library dependencies.
 pub fn resolve_std<'cfg>(
     ws: &Workspace<'cfg>,
-    target_data: &RustcTargetData,
+    target_data: &RustcTargetData<'cfg>,
     requested_targets: &[CompileKind],
     crates: &[String],
 ) -> CargoResult<(PackageSet<'cfg>, Resolve, ResolvedFeatures)> {
@@ -47,7 +47,7 @@ pub fn resolve_std<'cfg>(
         .iter()
         .map(|&name| {
             let source_path = SourceId::for_path(&src_path.join("library").join(name))?;
-            let dep = Dependency::parse_no_deprecated(name, None, source_path)?;
+            let dep = Dependency::parse(name, None, source_path)?;
             Ok(dep)
         })
         .collect::<CargoResult<Vec<_>>>()?;
@@ -185,7 +185,7 @@ pub fn generate_std_roots(
     Ok(ret)
 }
 
-fn detect_sysroot_src_path(target_data: &RustcTargetData) -> CargoResult<PathBuf> {
+fn detect_sysroot_src_path(target_data: &RustcTargetData<'_>) -> CargoResult<PathBuf> {
     if let Some(s) = env::var_os("__CARGO_TESTS_ONLY_SRC_ROOT") {
         return Ok(s.into());
     }
@@ -200,11 +200,19 @@ fn detect_sysroot_src_path(target_data: &RustcTargetData) -> CargoResult<PathBuf
         .join("rust");
     let lock = src_path.join("Cargo.lock");
     if !lock.exists() {
-        anyhow::bail!(
+        let msg = format!(
             "{:?} does not exist, unable to build with the standard \
              library, try:\n        rustup component add rust-src",
             lock
         );
+        match env::var("RUSTUP_TOOLCHAIN") {
+            Ok(rustup_toolchain) => {
+                anyhow::bail!("{} --toolchain {}", msg, rustup_toolchain);
+            }
+            Err(_) => {
+                anyhow::bail!(msg);
+            }
+        }
     }
     Ok(src_path)
 }

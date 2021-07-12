@@ -15,6 +15,7 @@ use serde::ser;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::core::compiler::{CompileKind, CompileTarget};
 use crate::core::dependency::DepKind;
 use crate::core::manifest::{ManifestMetadata, TargetSourcePath, Warnings};
 use crate::core::resolver::ResolveBehavior;
@@ -24,7 +25,9 @@ use crate::core::{GitReference, PackageIdSpec, SourceId, WorkspaceConfig, Worksp
 use crate::sources::{CRATES_IO_INDEX, CRATES_IO_REGISTRY};
 use crate::util::errors::{CargoResult, ManifestError};
 use crate::util::interning::InternedString;
-use crate::util::{self, config::ConfigRelativePath, validate_package_name, Config, IntoUrl};
+use crate::util::{
+    self, config::ConfigRelativePath, validate_package_name, Config, IntoUrl, VersionReqExt,
+};
 
 mod targets;
 use self::targets::targets;
@@ -34,7 +37,7 @@ use self::targets::targets;
 /// This could result in a real or virtual manifest being returned.
 ///
 /// A list of nested paths is also returned, one for each path dependency
-/// within the manfiest. For virtual manifests, these paths can only
+/// within the manifest. For virtual manifests, these paths can only
 /// come from patched or replaced dependencies. These paths are not
 /// canonicalized.
 pub fn read_manifest(
@@ -394,7 +397,7 @@ impl<'de> de::Deserialize<'de> for TomlOptLevel {
                     Ok(TomlOptLevel(value.to_string()))
                 } else {
                     Err(E::custom(format!(
-                        "must be an integer, `z`, or `s`, \
+                        "must be `0`, `1`, `2`, `3`, `s` or `z`, \
                          but found the string: \"{}\"",
                         value
                     )))
@@ -552,7 +555,7 @@ impl TomlProfile {
         if let Some(panic) = &self.panic {
             if panic != "unwind" && panic != "abort" {
                 bail!(
-                    "`panic` setting of `{}` is not a valid setting,\
+                    "`panic` setting of `{}` is not a valid setting, \
                      must be `unwind` or `abort`",
                     panic
                 );
@@ -777,6 +780,30 @@ impl<'de> de::Deserialize<'de> for VecStringOrBool {
     }
 }
 
+fn version_trim_whitespace<'de, D>(deserializer: D) -> Result<semver::Version, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = semver::Version;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("SemVer version")
+        }
+
+        fn visit_str<E>(self, string: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            string.trim().parse().map_err(de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_str(Visitor)
+}
+
 /// Represents the `package`/`project` sections of a `Cargo.toml`.
 ///
 /// Note that the order of the fields matters, since this is the order they
@@ -789,10 +816,15 @@ pub struct TomlProject {
     edition: Option<String>,
     rust_version: Option<String>,
     name: InternedString,
+    #[serde(deserialize_with = "version_trim_whitespace")]
     version: semver::Version,
     authors: Option<Vec<String>>,
     build: Option<StringOrBool>,
     metabuild: Option<StringOrVec>,
+    #[serde(rename = "default-target")]
+    default_target: Option<String>,
+    #[serde(rename = "forced-target")]
+    forced_target: Option<String>,
     links: Option<String>,
     exclude: Option<Vec<String>>,
     include: Option<Vec<String>>,
@@ -842,7 +874,6 @@ impl TomlProject {
 }
 
 struct Context<'a, 'b> {
-    pkgid: Option<PackageId>,
     deps: &'a mut Vec<Dependency>,
     source_id: SourceId,
     nested_paths: &'a mut Vec<PathBuf>,
@@ -1011,7 +1042,7 @@ impl TomlManifest {
         // Parse features first so they will be available when parsing other parts of the TOML.
         let empty = Vec::new();
         let cargo_features = me.cargo_features.as_ref().unwrap_or(&empty);
-        let features = Features::new(cargo_features, config, &mut warnings)?;
+        let features = Features::new(cargo_features, config, &mut warnings, source_id.is_path())?;
 
         let project = me.project.as_ref().or_else(|| me.package.as_ref());
         let project = project.ok_or_else(|| anyhow!("no `package` section found"))?;
@@ -1157,7 +1188,6 @@ impl TomlManifest {
 
         {
             let mut cx = Context {
-                pkgid: Some(pkgid),
                 deps: &mut deps,
                 source_id,
                 nested_paths: &mut nested_paths,
@@ -1313,9 +1343,24 @@ impl TomlManifest {
             }
         }
 
+        let default_kind = project
+            .default_target
+            .as_ref()
+            .map(|t| CompileTarget::new(&*t))
+            .transpose()?
+            .map(CompileKind::Target);
+        let forced_kind = project
+            .forced_target
+            .as_ref()
+            .map(|t| CompileTarget::new(&*t))
+            .transpose()?
+            .map(CompileKind::Target);
+
         let custom_metadata = project.metadata.clone();
         let mut manifest = Manifest::new(
             summary,
+            default_kind,
+            forced_kind,
             targets,
             exclude,
             include,
@@ -1406,11 +1451,10 @@ impl TomlManifest {
         let mut deps = Vec::new();
         let empty = Vec::new();
         let cargo_features = me.cargo_features.as_ref().unwrap_or(&empty);
-        let features = Features::new(cargo_features, config, &mut warnings)?;
+        let features = Features::new(cargo_features, config, &mut warnings, source_id.is_path())?;
 
         let (replace, patch) = {
             let mut cx = Context {
-                pkgid: None,
                 deps: &mut deps,
                 source_id,
                 nested_paths: &mut nested_paths,
@@ -1606,7 +1650,6 @@ impl<P: ResolveToPath> TomlDependency<P> {
     pub(crate) fn to_dependency_split(
         &self,
         name: &str,
-        pkgid: Option<PackageId>,
         source_id: SourceId,
         nested_paths: &mut Vec<PathBuf>,
         config: &Config,
@@ -1619,7 +1662,6 @@ impl<P: ResolveToPath> TomlDependency<P> {
         self.to_dependency(
             name,
             &mut Context {
-                pkgid,
                 deps: &mut Vec::new(),
                 source_id,
                 nested_paths,
@@ -1828,10 +1870,7 @@ impl<P: ResolveToPath> DetailedTomlDependency<P> {
         };
 
         let version = self.version.as_deref();
-        let mut dep = match cx.pkgid {
-            Some(id) => Dependency::parse(pkg_name, version, new_source_id, id, cx.config)?,
-            None => Dependency::parse_no_deprecated(pkg_name, version, new_source_id)?,
-        };
+        let mut dep = Dependency::parse(pkg_name, version, new_source_id)?;
         dep.set_features(self.features.iter().flatten())
             .set_default_features(
                 self.default_features

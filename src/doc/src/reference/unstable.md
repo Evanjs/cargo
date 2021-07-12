@@ -58,6 +58,55 @@ Each new feature described below should explain how to use it.
 [nightly channel]: ../../book/appendix-07-nightly-rust.html
 [stabilized]: https://doc.crates.io/contrib/process/unstable.html#stabilization
 
+### List of unstable features
+
+* Unstable-specific features
+    * [-Z allow-features](#allow-features) — Provides a way to restrict which unstable features are used.
+* Build scripts and linking
+    * [extra-link-arg](#extra-link-arg) — Allows build scripts to pass extra link arguments in more cases.
+    * [Metabuild](#metabuild) — Provides declarative build scripts.
+* Resolver and features
+    * [no-index-update](#no-index-update) — Prevents cargo from updating the index cache.
+    * [avoid-dev-deps](#avoid-dev-deps) — Prevents the resolver from including dev-dependencies during resolution.
+    * [minimal-versions](#minimal-versions) — Forces the resolver to use the lowest compatible version instead of the highest.
+    * [public-dependency](#public-dependency) — Allows dependencies to be classified as either public or private.
+    * [Namespaced features](#namespaced-features) — Separates optional dependencies into a separate namespace from regular features, and allows feature names to be the same as some dependency name.
+    * [Weak dependency features](#weak-dependency-features) — Allows setting features for dependencies without enabling optional dependencies.
+* Output behavior
+    * [out-dir](#out-dir) — Adds a directory where artifacts are copied to.
+    * [terminal-width](#terminal-width) — Tells rustc the width of the terminal so that long diagnostic messages can be truncated to be more readable.
+* Compile behavior
+    * [mtime-on-use](#mtime-on-use) — Updates the last-modified timestamp on every dependency every time it is used, to provide a mechanism to delete unused artifacts.
+    * [doctest-xcompile](#doctest-xcompile) — Supports running doctests with the `--target` flag.
+    * [multitarget](#multitarget) — Supports building for multiple targets at the same time.
+    * [build-std](#build-std) — Builds the standard library instead of using pre-built binaries.
+    * [build-std-features](#build-std-features) — Sets features to use with the standard library.
+    * [binary-dep-depinfo](#binary-dep-depinfo) — Causes the dep-info file to track binary dependencies.
+    * [panic-abort-tests](#panic-abort-tests) — Allows running tests with the "abort" panic strategy.
+* rustdoc
+    * [`doctest-in-workspace`](#doctest-in-workspace) — Fixes workspace-relative paths when running doctests.
+    * [rustdoc-map](#rustdoc-map) — Provides mappings for documentation to link to external sites like [docs.rs](https://docs.rs/).
+* `Cargo.toml` extensions
+    * [Custom named profiles](#custom-named-profiles) — Adds custom named profiles in addition to the standard names.
+    * [Profile `strip` option](#profile-strip-option) — Forces the removal of debug information and symbols from executables.
+    * [per-package-target](#per-package-target) — Sets the `--target` to use for each individual package.
+    * [rust-version](#rust-version) — Allows to declare the minimum supported Rust version.
+    * [Edition 2021](#edition-2021) — Adds support for the 2021 Edition.
+* Information and metadata
+    * [Build-plan](#build-plan) — Emits JSON information on which commands will be run.
+    * [timings](#timings) — Generates a report on how long individual dependencies took to run.
+    * [unit-graph](#unit-graph) — Emits JSON for Cargo's internal graph structure.
+    * [future incompat report](#future-incompat-report) — Displays a report for future incompatibilities that may error in the future.
+* Configuration
+    * [config-cli](#config-cli) — Adds the ability to pass configuration options on the command-line.
+    * [config-include](#config-include) — Adds the ability for config files to include other files.
+    * [configurable-env](#configurable-env) — Adds support for defining environment variables that will be set when building and running.
+    * [patch-in-config](#patch-in-config) — Adds support for specifying the `[patch]` table in config files.
+    * [`cargo config`](#cargo-config) — Adds a new subcommand for viewing config files.
+* Registries
+    * [credential-process](#credential-process) — Adds support for fetching registry tokens from an external authentication program.
+    * [`cargo logout`](#cargo-logout) — Adds the `logout` command to remove the currently saved registry token.
+
 ### allow-features
 
 This permanently-unstable flag makes it so that only a listed set of
@@ -85,13 +134,16 @@ to any Rust tools that cargo ends up calling (like `rustc` or
 Cargo _or_ Rust features can be used.
 
 ### extra-link-arg
+* Tracking Issue: [#9426](https://github.com/rust-lang/cargo/issues/9426)
 * Original Pull Request: [#7811](https://github.com/rust-lang/cargo/pull/7811)
 
-The `-Z extra-link-arg` flag makes the following two instructions available
+The `-Z extra-link-arg` flag makes the following instructions available
 in build scripts:
 
 * [`cargo:rustc-link-arg-bins=FLAG`](#rustc-link-arg-bins) – Passes custom
   flags to a linker for binaries.
+* [`cargo:rustc-link-arg-bin=BIN=FLAG`](#rustc-link-arg-bin) – Passes custom
+  flags to a linker for the binary `BIN`.
 * [`cargo:rustc-link-arg=FLAG`](#rustc-link-arg) – Passes custom flags to a
   linker for benchmarks, binaries, `cdylib` crates, examples, and tests.
 
@@ -101,6 +153,16 @@ in build scripts:
 The `rustc-link-arg-bins` instruction tells Cargo to pass the [`-C
 link-arg=FLAG` option][link-arg] to the compiler, but only when building a
 binary target. Its usage is highly platform specific. It is useful
+to set a linker script or other linker options.
+
+[link-arg]: ../../rustc/codegen-options/index.md#link-arg
+
+<a id="rustc-link-arg-bin"></a>
+#### `cargo:rustc-link-arg-bin=BIN=FLAG`
+
+The `rustc-link-arg-bin` instruction tells Cargo to pass the [`-C
+link-arg=FLAG` option][link-arg] to the compiler, but only when building
+the binary target with name `BIN`. Its usage is highly platform specific. It is useful
 to set a linker script or other linker options.
 
 [link-arg]: ../../rustc/codegen-options/index.md#link-arg
@@ -138,7 +200,7 @@ invocations of nightly cargo. (the config flag is ignored by stable)
 
 ### avoid-dev-deps
 * Original Issue: [#4988](https://github.com/rust-lang/cargo/issues/4988)
-* Stabilization Issue: [#5133](https://github.com/rust-lang/cargo/issues/5133)
+* Tracking Issue: [#5133](https://github.com/rust-lang/cargo/issues/5133)
 
 When running commands such as `cargo install` or `cargo build`, Cargo
 currently requires dev-dependencies to be downloaded, even if they are not
@@ -157,7 +219,7 @@ generated if dev-dependencies are skipped.
 > versions for direct dependencies.
 
 When a `Cargo.lock` file is generated, the `-Z minimal-versions` flag will
-resolve the dependencies to the minimum semver version that will satisfy the
+resolve the dependencies to the minimum SemVer version that will satisfy the
 requirements (instead of the greatest version).
 
 The intended use-case of this flag is to check, during continuous integration,
@@ -569,6 +631,8 @@ itself, which has implicit dependencies on the standard library that would
 otherwise be untracked for change-detection.
 
 ### panic-abort-tests
+* Tracking Issue: [#67650](https://github.com/rust-lang/rust/issues/67650)
+* Original Pull Request: [#7460](https://github.com/rust-lang/cargo/pull/7460)
 
 The `-Z panic-abort-tests` flag will enable nightly support to compile test
 harness crates with `-Cpanic=abort`. Without this flag Cargo will compile tests,
@@ -640,6 +704,61 @@ cargo +nightly -Zunstable-options -Zconfig-include --config somefile.toml build
 ```
 
 CLI paths are relative to the current working directory.
+
+### target-applies-to-host
+* Original Pull Request: [#9322](https://github.com/rust-lang/cargo/pull/9322)
+* Tracking Issue: [#9453](https://github.com/rust-lang/cargo/issues/9453)
+
+The `target-applies-to-host` key in a config file can be used set the desired
+behavior for passing target config flags to build scripts.
+
+It requires the `-Ztarget-applies-to-host` command-line option.
+
+The current default for `target-applies-to-host` is `true`, which will be
+changed to `false` in the future, if `-Zhost-config` is used the new `false`
+default will be set for `target-applies-to-host`.
+
+```toml
+# config.toml
+target-applies-to-host = false
+```
+
+```console
+cargo +nightly -Ztarget-applies-to-host build --target x86_64-unknown-linux-gnu
+```
+
+### host-config
+* Original Pull Request: [#9322](https://github.com/rust-lang/cargo/pull/9322)
+* Tracking Issue: [#9452](https://github.com/rust-lang/cargo/issues/9452)
+
+The `host` key in a config file can be used pass flags to host build targets
+such as build scripts that must run on the host system instead of the target
+system when cross compiling. It supports both generic and host arch specific
+tables. Matching host arch tables take precedence over generic host tables.
+
+It requires the `-Zhost-config` and `-Ztarget-applies-to-host` command-line
+options to be set.
+
+```toml
+# config.toml
+[host]
+linker = "/path/to/host/linker"
+[host.x86_64-unknown-linux-gnu]
+linker = "/path/to/host/arch/linker"
+[target.x86_64-unknown-linux-gnu]
+linker = "/path/to/target/linker"
+```
+
+The generic `host` table above will be entirely ignored when building on a
+`x86_64-unknown-linux-gnu` host as the `host.x86_64-unknown-linux-gnu` table
+takes precedence.
+
+Setting `-Zhost-config` changes the default for `target-applies-to-host` to
+`false` from `true`.
+
+```console
+cargo +nightly -Ztarget-applies-to-host -Zhost-config build --target x86_64-unknown-linux-gnu
+```
 
 ### unit-graph
 * Tracking Issue: [#8002](https://github.com/rust-lang/cargo/issues/8002)
@@ -795,7 +914,7 @@ Other possible string values of `strip` are `none`, `symbols`, and `off`. The de
 
 You can also configure this option with the two absolute boolean values
 `true` and `false`. The former enables `strip` at its higher level, `symbols`,
-whilst the later disables `strip` completely.
+while the latter disables `strip` completely.
 
 ### rustdoc-map
 * Tracking Issue: [#8296](https://github.com/rust-lang/cargo/issues/8296)
@@ -839,6 +958,9 @@ The default value is `"remote"`.
 The value may also take a URL for a custom location.
 
 ### terminal-width
+
+* Tracking Issue: [#84673](https://github.com/rust-lang/rust/issues/84673)
+
 This feature provides a new flag, `-Z terminal-width`, which is used to pass
 a terminal width to `rustc` so that error messages containing long lines
 can be intelligently truncated.
@@ -894,6 +1016,29 @@ std = ["serde?/std"]
 In this example, the `std` feature enables the `std` feature on the `serde`
 dependency. However, unlike the normal `serde/std` syntax, it will not enable
 the optional dependency `serde` unless something else has included it.
+
+### per-package-target
+* Tracking Issue: [#9406](https://github.com/rust-lang/cargo/pull/9406)
+* Original Pull Request: [#9030](https://github.com/rust-lang/cargo/pull/9030)
+* Original Issue: [#7004](https://github.com/rust-lang/cargo/pull/7004)
+
+The `per-package-target` feature adds two keys to the manifest:
+`package.default-target` and `package.forced-target`. The first makes
+the package be compiled by default (ie. when no `--target` argument is
+passed) for some target. The second one makes the package always be
+compiled for the target.
+
+Example:
+
+```toml
+[package]
+forced-target = "wasm32-unknown-unknown"
+```
+
+In this example, the crate is always built for
+`wasm32-unknown-unknown`, for instance because it is going to be used
+as a plugin for a main program that runs on the host (or provided on
+the command line) target.
 
 ### credential-process
 * Tracking Issue: [#8933](https://github.com/rust-lang/cargo/issues/8933)
@@ -1075,7 +1220,7 @@ cargo logout -Z credential-process
 * RFC: [#2495](https://github.com/rust-lang/rfcs/blob/master/text/2495-min-rust-version.md)
 * rustc Tracking Issue: [#65262](https://github.com/rust-lang/rust/issues/65262)
 
-The `-Z rust-version` flag enables the reading the `rust-version` field in the
+The `-Z rust-version` flag enables the reading of the `rust-version` field in the
 Cargo manifest `package` section. This can be used by a package to state a minimal
 version of the compiler required to build the package. An error is generated if
 the version of rustc is older than the stated `rust-version`. The
@@ -1091,6 +1236,7 @@ rust-version = "1.42"
 ```
 
 ### edition 2021
+* Tracking Issue: [rust-lang/rust#85811](https://github.com/rust-lang/rust/issues/85811)
 
 Support for the 2021 [edition] can be enabled by adding the `edition2021`
 unstable feature to the top of `Cargo.toml`:
@@ -1121,12 +1267,22 @@ The 2021 edition will set the default [resolver version] to "2".
 * RFC: [#2834](https://github.com/rust-lang/rfcs/blob/master/text/2834-cargo-report-future-incompat.md)
 * rustc Tracking Issue: [#71249](https://github.com/rust-lang/rust/issues/71249)
 
-The `-Z future-incompat-report` flag enables the creation of a future-incompat report
-for all dependencies. This makes users aware if any of their crate's dependencies
-might stop compiling with a future version of Rust.
+The `-Z future-incompat-report` flag causes Cargo to check for
+future-incompatible warnings in all dependencies. These are warnings for
+changes that may become hard errors in the future, causing the dependency to
+stop building in a future version of rustc. If any warnings are found, a small
+notice is displayed indicating that the warnings were found, and provides
+instructions on how to display a full report.
+
+A full report can be displayed with the `cargo report future-incompatibilities
+-Z future-incompat-report --id ID` command, or by running the build again with
+the `--future-incompat-report` flag. The developer should then update their
+dependencies to a version where the issue is fixed, or work with the
+developers of the dependencies to help resolve the issue.
 
 ### configurable-env
 * Original Pull Request: [#9175](https://github.com/rust-lang/cargo/pull/9175)
+* Tracking Issue: [#9539](https://github.com/rust-lang/cargo/issues/9539)
 
 The `-Z configurable-env` flag enables the `[env]` section in the
 `.cargo/config.toml` file. This section allows you to set additional environment
@@ -1176,7 +1332,7 @@ lowest precedence.
 Relative `path` dependencies in such a `[patch]` section are resolved
 relative to the configuration file they appear in.
 
-## `cargo config`
+### `cargo config`
 
 * Original Issue: [#2362](https://github.com/rust-lang/cargo/issues/2362)
 * Tracking Issue: [#9301](https://github.com/rust-lang/cargo/issues/9301)
@@ -1192,35 +1348,134 @@ cargo +nightly -Zunstable-options config get build.rustflags
 If no config value is included, it will display all config values. See the
 `--help` output for more options available.
 
+### `doctest-in-workspace`
 
-<script>
-(function() {
-    var fragments = {
-        "#edition": "manifest.html#the-edition-field",
-        "#compile-progress": "config.html#termprogresswhen",
-        "#rename-dependency": "specifying-dependencies.html#renaming-dependencies-in-cargotoml",
-        "#alternate-registries": "registries.html",
-        "#offline-mode": "../commands/cargo.html",
-        "#publish-lockfile": "../commands/cargo-package.html",
-        "#default-run": "manifest.html#the-default-run-field",
-        "#cache-messages": "https://github.com/rust-lang/cargo/pull/7450",
-        "#install-upgrade": "../commands/cargo-install.html",
-        "#profile-overrides": "profiles.html#overrides",
-        "#config-profiles": "config.html#profile",
-        "#crate-versions": "https://github.com/rust-lang/cargo/pull/8509",
-        "#features": "features.html#feature-resolver-version-2",
-        "#package-features": "features.html#resolver-version-2-command-line-flags",
-        "#resolver": "resolver.html#resolver-versions",
-    };
-    var target = fragments[window.location.hash];
-    if (target) {
-        if (target.startsWith('https')) {
-          window.location.replace(target);
-        } else {
-          var url = window.location.toString();
-          var base = url.substring(0, url.lastIndexOf('/'));
-          window.location.replace(base + "/" + target);
-        }
-    }
-})();
-</script>
+* Tracking Issue: [#9427](https://github.com/rust-lang/cargo/issues/9427)
+
+The `-Z doctest-in-workspace` flag changes the behavior of the current working
+directory used when running doctests. Historically, Cargo has run `rustdoc
+--test` relative to the root of the package, with paths relative from that
+root. However, this is inconsistent with how `rustc` and `rustdoc` are
+normally run in a workspace, where they are run relative to the workspace
+root. This inconsistency causes problems in various ways, such as when passing
+RUSTDOCFLAGS with relative paths, or dealing with diagnostic output.
+
+The `-Z doctest-in-workspace` flag causes cargo to switch to running `rustdoc`
+from the root of the workspace. It also passes the `--test-run-directory` to
+`rustdoc` so that when *running* the tests, they are run from the root of the
+package. This preserves backwards compatibility and is consistent with how
+normal unittests are run.
+
+### rustc `--print`
+
+* Tracking Issue: [#9357](https://github.com/rust-lang/cargo/issues/9357)
+
+`cargo rustc --print=VAL` forwards the `--print` flag to `rustc` in order to
+extract information from `rustc`. This runs `rustc` with the corresponding
+[`--print`](https://doc.rust-lang.org/rustc/command-line-arguments.html#--print-print-compiler-information)
+flag, and then immediately exits without compiling. Exposing this as a cargo
+flag allows cargo to inject the correct target and RUSTFLAGS based on the
+current configuration.
+
+The primary use case is to run `cargo rustc --print=cfg` to get config values
+for the appropriate target and influenced by any other RUSTFLAGS.
+
+
+
+## Stabilized and removed features
+
+### Compile progress
+
+The compile-progress feature has been stabilized in the 1.30 release.
+Progress bars are now enabled by default.
+See [`term.progress`](config.md#termprogresswhen) for more information about
+controlling this feature.
+
+### Edition
+
+Specifying the `edition` in `Cargo.toml` has been stabilized in the 1.31 release.
+See [the edition field](manifest.md#the-edition-field) for more information
+about specifying this field.
+
+### rename-dependency
+
+Specifying renamed dependencies in `Cargo.toml` has been stabilized in the 1.31 release.
+See [renaming dependencies](specifying-dependencies.md#renaming-dependencies-in-cargotoml)
+for more information about renaming dependencies.
+
+### Alternate Registries
+
+Support for alternate registries has been stabilized in the 1.34 release.
+See the [Registries chapter](registries.md) for more information about alternate registries.
+
+### Offline Mode
+
+The offline feature has been stabilized in the 1.36 release.
+See the [`--offline` flag](../commands/cargo.md#option-cargo---offline) for
+more information on using the offline mode.
+
+### publish-lockfile
+
+The `publish-lockfile` feature has been removed in the 1.37 release.
+The `Cargo.lock` file is always included when a package is published if the
+package contains a binary target. `cargo install` requires the `--locked` flag
+to use the `Cargo.lock` file.
+See [`cargo package`](../commands/cargo-package.md) and
+[`cargo install`](../commands/cargo-install.md) for more information.
+
+### default-run
+
+The `default-run` feature has been stabilized in the 1.37 release.
+See [the `default-run` field](manifest.md#the-default-run-field) for more
+information about specifying the default target to run.
+
+### cache-messages
+
+Compiler message caching has been stabilized in the 1.40 release.
+Compiler warnings are now cached by default and will be replayed automatically
+when re-running Cargo.
+
+### install-upgrade
+
+The `install-upgrade` feature has been stabilized in the 1.41 release.
+[`cargo install`] will now automatically upgrade packages if they appear to be
+out-of-date. See the [`cargo install`] documentation for more information.
+
+[`cargo install`]: ../commands/cargo-install.md
+
+### Profile Overrides
+
+Profile overrides have been stabilized in the 1.41 release.
+See [Profile Overrides](profiles.md#overrides) for more information on using
+overrides.
+
+### Config Profiles
+
+Specifying profiles in Cargo config files and environment variables has been
+stabilized in the 1.43 release.
+See the [config `[profile]` table](config.md#profile) for more information
+about specifying [profiles](profiles.md) in config files.
+
+### crate-versions
+
+The `-Z crate-versions` flag has been stabilized in the 1.47 release.
+The crate version is now automatically included in the
+[`cargo doc`](../commands/cargo-doc.md) documentation sidebar.
+
+### Features
+
+The `-Z features` flag has been stabilized in the 1.51 release.
+See [feature resolver version 2](features.md#feature-resolver-version-2)
+for more information on using the new feature resolver.
+
+### package-features
+
+The `-Z package-features` flag has been stabilized in the 1.51 release.
+See the [resolver version 2 command-line flags](features.md#resolver-version-2-command-line-flags)
+for more information on using the features CLI options.
+
+### Resolver
+
+The `resolver` feature in `Cargo.toml` has been stabilized in the 1.51 release.
+See the [resolver versions](resolver.md#resolver-versions) for more
+information about specifying resolvers.

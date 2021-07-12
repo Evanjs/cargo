@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::{self, Debug, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,8 +109,17 @@ impl<'cfg> PathSource<'cfg> {
     fn _list_files(&self, pkg: &Package) -> CargoResult<Vec<PathBuf>> {
         let root = pkg.root();
         let no_include_option = pkg.manifest().include().is_empty();
+        let git_repo = if no_include_option {
+            self.discover_git_repo(root)?
+        } else {
+            None
+        };
 
         let mut exclude_builder = GitignoreBuilder::new(root);
+        if no_include_option && git_repo.is_none() {
+            // no include option and not git repo discovered (see rust-lang/cargo#7183).
+            exclude_builder.add_line(None, ".*")?;
+        }
         for rule in pkg.manifest().exclude() {
             exclude_builder.add_line(None, rule)?;
         }
@@ -161,23 +171,16 @@ impl<'cfg> PathSource<'cfg> {
 
         // Attempt Git-prepopulate only if no `include` (see rust-lang/cargo#4135).
         if no_include_option {
-            if let Some(result) = self.discover_git_and_list_files(pkg, root, &mut filter)? {
-                return Ok(result);
+            if let Some(repo) = git_repo {
+                return self.list_files_git(pkg, &repo, &mut filter);
             }
-            // no include option and not git repo discovered (see rust-lang/cargo#7183).
-            return self.list_files_walk_except_dot_files_and_dirs(pkg, &mut filter);
         }
         self.list_files_walk(pkg, &mut filter)
     }
 
-    // Returns `Some(_)` if found sibling `Cargo.toml` and `.git` directory;
-    // otherwise, caller should fall back on full file list.
-    fn discover_git_and_list_files(
-        &self,
-        pkg: &Package,
-        root: &Path,
-        filter: &mut dyn FnMut(&Path, bool) -> CargoResult<bool>,
-    ) -> CargoResult<Option<Vec<PathBuf>>> {
+    /// Returns `Some(git2::Repository)` if found sibling `Cargo.toml` and `.git`
+    /// directory; otherwise, caller should fall back on full file list.
+    fn discover_git_repo(&self, root: &Path) -> CargoResult<Option<git2::Repository>> {
         let repo = match git2::Repository::discover(root) {
             Ok(repo) => repo,
             Err(e) => {
@@ -212,7 +215,7 @@ impl<'cfg> PathSource<'cfg> {
         };
         let manifest_path = repo_relative_path.join("Cargo.toml");
         if index.get_path(&manifest_path, 0).is_some() {
-            return Ok(Some(self.list_files_git(pkg, &repo, filter)?));
+            return Ok(Some(repo));
         }
         // Package Cargo.toml is not in git, don't use git to guide our selection.
         Ok(None)
@@ -259,19 +262,36 @@ impl<'cfg> PathSource<'cfg> {
             opts.pathspec(suffix);
         }
         let statuses = repo.statuses(Some(&mut opts))?;
-        let untracked = statuses.iter().filter_map(|entry| match entry.status() {
-            // Don't include Cargo.lock if it is untracked. Packaging will
-            // generate a new one as needed.
-            git2::Status::WT_NEW if entry.path() != Some("Cargo.lock") => {
-                Some((join(root, entry.path_bytes()), None))
-            }
-            _ => None,
-        });
+        let mut skip_paths = HashSet::new();
+        let untracked: Vec<_> = statuses
+            .iter()
+            .filter_map(|entry| {
+                match entry.status() {
+                    // Don't include Cargo.lock if it is untracked. Packaging will
+                    // generate a new one as needed.
+                    git2::Status::WT_NEW if entry.path() != Some("Cargo.lock") => {
+                        Some(Ok((join(root, entry.path_bytes()), None)))
+                    }
+                    git2::Status::WT_DELETED => {
+                        let path = match join(root, entry.path_bytes()) {
+                            Ok(p) => p,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        skip_paths.insert(path);
+                        None
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<CargoResult<_>>()?;
 
         let mut subpackages_found = Vec::new();
 
         for (file_path, is_dir) in index_files.chain(untracked) {
             let file_path = file_path?;
+            if skip_paths.contains(&file_path) {
+                continue;
+            }
 
             // Filter out files blatantly outside this package. This is helped a
             // bit above via the `pathspec` function call, but we need to filter
@@ -354,27 +374,6 @@ impl<'cfg> PathSource<'cfg> {
                 )),
             }
         }
-    }
-
-    fn list_files_walk_except_dot_files_and_dirs(
-        &self,
-        pkg: &Package,
-        filter: &mut dyn FnMut(&Path, bool) -> CargoResult<bool>,
-    ) -> CargoResult<Vec<PathBuf>> {
-        let root = pkg.root();
-        let mut exclude_dot_files_dir_builder = GitignoreBuilder::new(root);
-        exclude_dot_files_dir_builder.add_line(None, ".*")?;
-        let ignore_dot_files_and_dirs = exclude_dot_files_dir_builder.build()?;
-
-        let mut filter_ignore_dot_files_and_dirs =
-            |path: &Path, is_dir: bool| -> CargoResult<bool> {
-                let relative_path = path.strip_prefix(root)?;
-                match ignore_dot_files_and_dirs.matched_path_or_any_parents(relative_path, is_dir) {
-                    Match::Ignore(_) => Ok(false),
-                    _ => filter(path, is_dir),
-                }
-            };
-        self.list_files_walk(pkg, &mut filter_ignore_dot_files_and_dirs)
     }
 
     fn list_files_walk(

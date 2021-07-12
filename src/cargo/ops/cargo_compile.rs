@@ -467,11 +467,17 @@ pub fn create_bcx<'a, 'cfg>(
         })
         .collect();
 
+    // Passing `build_config.requested_kinds` instead of
+    // `explicit_host_kinds` here so that `generate_targets` can do
+    // its own special handling of `CompileKind::Host`. It will
+    // internally replace the host kind by the `explicit_host_kind`
+    // before setting as a unit.
     let mut units = generate_targets(
         ws,
         &to_builds,
         filter,
-        &explicit_host_kinds,
+        &build_config.requested_kinds,
+        explicit_host_kind,
         build_config.mode,
         &resolve,
         &workspace_resolve,
@@ -562,7 +568,7 @@ pub fn create_bcx<'a, 'cfg>(
             // the target is a binary. Binary crates get their private items
             // documented by default.
             if rustdoc_document_private_items || unit.target.is_bin() {
-                let mut args = extra_args.take().unwrap_or_else(|| vec![]);
+                let mut args = extra_args.take().unwrap_or_default();
                 args.push("--document-private-items".into());
                 extra_args = Some(args);
             }
@@ -842,6 +848,7 @@ fn generate_targets(
     packages: &[&Package],
     filter: &CompileFilter,
     requested_kinds: &[CompileKind],
+    explicit_host_kind: CompileKind,
     mode: CompileMode,
     resolve: &Resolve,
     workspace_resolve: &Option<Resolve>,
@@ -915,7 +922,27 @@ fn generate_targets(
             let features_for = FeaturesFor::from_for_host(target.proc_macro());
             let features = resolved_features.activated_features(pkg.package_id(), features_for);
 
-            for kind in requested_kinds {
+            // If `--target` has not been specified, then the unit
+            // graph is built almost like if `--target $HOST` was
+            // specified. See `rebuild_unit_graph_shared` for more on
+            // why this is done. However, if the package has its own
+            // `package.target` key, then this gets used instead of
+            // `$HOST`
+            let explicit_kinds = if let Some(k) = pkg.manifest().forced_kind() {
+                vec![k]
+            } else {
+                requested_kinds
+                    .iter()
+                    .map(|kind| match kind {
+                        CompileKind::Host => {
+                            pkg.manifest().default_kind().unwrap_or(explicit_host_kind)
+                        }
+                        CompileKind::Target(t) => CompileKind::Target(*t),
+                    })
+                    .collect()
+            };
+
+            for kind in explicit_kinds.iter() {
                 let profile = profiles.get_profile(
                     pkg.package_id(),
                     ws.is_member(pkg),
@@ -1065,6 +1092,9 @@ fn generate_targets(
     // It is computed by the set of enabled features for the package plus
     // every enabled feature of every enabled dependency.
     let mut features_map = HashMap::new();
+    // This needs to be a set to de-duplicate units. Due to the way the
+    // targets are filtered, it is possible to have duplicate proposals for
+    // the same thing.
     let mut units = HashSet::new();
     for Proposal {
         pkg,
@@ -1109,7 +1139,62 @@ fn generate_targets(
         }
         // else, silently skip target.
     }
-    Ok(units.into_iter().collect())
+    let mut units: Vec<_> = units.into_iter().collect();
+    unmatched_target_filters(&units, filter, &mut ws.config().shell())?;
+
+    // Keep the roots in a consistent order, which helps with checking test output.
+    units.sort_unstable();
+    Ok(units)
+}
+
+/// Checks if the unit list is empty and the user has passed any combination of
+/// --tests, --examples, --benches or --bins, and we didn't match on any targets.
+/// We want to emit a warning to make sure the user knows that this run is a no-op,
+/// and their code remains unchecked despite cargo not returning any errors
+fn unmatched_target_filters(
+    units: &[Unit],
+    filter: &CompileFilter,
+    shell: &mut Shell,
+) -> CargoResult<()> {
+    if let CompileFilter::Only {
+        all_targets,
+        lib: _,
+        ref bins,
+        ref examples,
+        ref tests,
+        ref benches,
+    } = *filter
+    {
+        if units.is_empty() {
+            let mut filters = String::new();
+            let mut miss_count = 0;
+
+            let mut append = |t: &FilterRule, s| {
+                if let FilterRule::All = *t {
+                    miss_count += 1;
+                    filters.push_str(s);
+                }
+            };
+
+            if all_targets {
+                filters.push_str(" `all-targets`");
+            } else {
+                append(bins, " `bins`,");
+                append(tests, " `tests`,");
+                append(examples, " `examples`,");
+                append(benches, " `benches`,");
+                filters.pop();
+            }
+
+            return shell.warn(format!(
+                "Target {}{} specified, but no targets matched. This is a no-op",
+                if miss_count > 1 { "filters" } else { "filter" },
+                filters,
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Warns if a target's required-features references a feature that doesn't exist.
@@ -1140,10 +1225,7 @@ fn validate_required_features(
                     ))?;
                 }
             }
-            FeatureValue::Dep { .. }
-            | FeatureValue::DepFeature {
-                dep_prefix: true, ..
-            } => {
+            FeatureValue::Dep { .. } => {
                 anyhow::bail!(
                     "invalid feature `{}` in required-features of target `{}`: \
                     `dep:` prefixed feature values are not allowed in required-features",
@@ -1163,7 +1245,6 @@ fn validate_required_features(
             FeatureValue::DepFeature {
                 dep_name,
                 dep_feature,
-                dep_prefix: false,
                 weak: false,
             } => {
                 match resolve

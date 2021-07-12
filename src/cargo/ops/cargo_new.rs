@@ -51,6 +51,7 @@ impl<'de> de::Deserialize<'de> for VersionControl {
 pub struct NewOptions {
     pub version_control: Option<VersionControl>,
     pub kind: NewProjectKind,
+    pub auto_detect_kind: bool,
     /// Absolute path to the directory for the new package
     pub path: PathBuf,
     pub name: Option<String>,
@@ -106,16 +107,18 @@ impl NewOptions {
         edition: Option<String>,
         registry: Option<String>,
     ) -> CargoResult<NewOptions> {
+        let auto_detect_kind = !bin && !lib;
+
         let kind = match (bin, lib) {
             (true, true) => anyhow::bail!("can't specify both lib and binary outputs"),
             (false, true) => NewProjectKind::Lib,
-            // default to bin
             (_, false) => NewProjectKind::Bin,
         };
 
         let opts = NewOptions {
             version_control,
             kind,
+            auto_detect_kind,
             path,
             name,
             edition,
@@ -389,6 +392,26 @@ fn plan_new_source_file(bin: bool, package_name: String) -> SourceFileInformatio
     }
 }
 
+fn calculate_new_project_kind(
+    requested_kind: NewProjectKind,
+    auto_detect_kind: bool,
+    found_files: &Vec<SourceFileInformation>,
+) -> NewProjectKind {
+    let bin_file = found_files.iter().find(|x| x.bin);
+
+    let kind_from_files = if !found_files.is_empty() && bin_file.is_none() {
+        NewProjectKind::Lib
+    } else {
+        NewProjectKind::Bin
+    };
+
+    if auto_detect_kind {
+        return kind_from_files;
+    }
+
+    requested_kind
+}
+
 pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
     let path = &opts.path;
     if path.exists() {
@@ -399,20 +422,17 @@ pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
         )
     }
 
+    let is_bin = opts.kind.is_bin();
+
     let name = get_name(path, opts)?;
-    check_name(
-        name,
-        opts.name.is_none(),
-        opts.kind.is_bin(),
-        &mut config.shell(),
-    )?;
+    check_name(name, opts.name.is_none(), is_bin, &mut config.shell())?;
 
     let mkopts = MkOptions {
         version_control: opts.version_control,
         path,
         name,
         source_files: vec![plan_new_source_file(opts.kind.is_bin(), name.to_string())],
-        bin: opts.kind.is_bin(),
+        bin: is_bin,
         edition: opts.edition.as_deref(),
         registry: opts.registry.as_deref(),
     };
@@ -427,7 +447,7 @@ pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
     Ok(())
 }
 
-pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<()> {
+pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<NewProjectKind> {
     // This is here just as a random location to exercise the internal error handling.
     if std::env::var_os("__CARGO_TEST_INTERNAL_ERROR").is_some() {
         return Err(crate::util::internal("internal error test"));
@@ -445,14 +465,34 @@ pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<()> {
 
     detect_source_paths_and_types(path, name, &mut src_paths_types)?;
 
+    let kind = calculate_new_project_kind(opts.kind, opts.auto_detect_kind, &src_paths_types);
+    let has_bin = kind.is_bin();
+
     if src_paths_types.is_empty() {
-        src_paths_types.push(plan_new_source_file(opts.kind.is_bin(), name.to_string()));
-    } else {
-        // --bin option may be ignored if lib.rs or src/lib.rs present
-        // Maybe when doing `cargo init --bin` inside a library package stub,
-        // user may mean "initialize for library, but also add binary target"
+        src_paths_types.push(plan_new_source_file(has_bin, name.to_string()));
+    } else if src_paths_types.len() == 1 && !src_paths_types.iter().any(|x| x.bin == has_bin) {
+        // we've found the only file and it's not the type user wants. Change the type and warn
+        let file_type = if src_paths_types[0].bin {
+            NewProjectKind::Bin
+        } else {
+            NewProjectKind::Lib
+        };
+        config.shell().warn(format!(
+            "file `{}` seems to be a {} file",
+            src_paths_types[0].relative_path, file_type
+        ))?;
+        src_paths_types[0].bin = has_bin
+    } else if src_paths_types.len() > 1 && !has_bin {
+        // We have found both lib and bin files and the user would like us to treat both as libs
+        anyhow::bail!(
+            "cannot have a package with \
+             multiple libraries, \
+             found both `{}` and `{}`",
+            src_paths_types[0].relative_path,
+            src_paths_types[1].relative_path
+        )
     }
-    let has_bin = src_paths_types.iter().any(|x| x.bin);
+
     check_name(name, opts.name.is_none(), has_bin, &mut config.shell())?;
 
     let mut version_control = opts.version_control;
@@ -508,7 +548,7 @@ pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<()> {
             path.display()
         )
     })?;
-    Ok(())
+    Ok(kind)
 }
 
 /// IgnoreList
@@ -517,6 +557,8 @@ struct IgnoreList {
     ignore: Vec<String>,
     /// mercurial formatted entries
     hg_ignore: Vec<String>,
+    /// Fossil-formatted entries.
+    fossil_ignore: Vec<String>,
 }
 
 impl IgnoreList {
@@ -525,15 +567,17 @@ impl IgnoreList {
         IgnoreList {
             ignore: Vec::new(),
             hg_ignore: Vec::new(),
+            fossil_ignore: Vec::new(),
         }
     }
 
-    /// add a new entry to the ignore list. Requires two arguments with the
-    /// entry in two different formats. One for "git style" entries and one for
-    /// "mercurial like" entries.
-    fn push(&mut self, ignore: &str, hg_ignore: &str) {
+    /// Add a new entry to the ignore list. Requires three arguments with the
+    /// entry in possibly three different formats. One for "git style" entries,
+    /// one for "mercurial style" entries and one for "fossil style" entries.
+    fn push(&mut self, ignore: &str, hg_ignore: &str, fossil_ignore: &str) {
         self.ignore.push(ignore.to_string());
         self.hg_ignore.push(hg_ignore.to_string());
+        self.fossil_ignore.push(fossil_ignore.to_string());
     }
 
     /// Return the correctly formatted content of the ignore file for the given
@@ -541,6 +585,7 @@ impl IgnoreList {
     fn format_new(&self, vcs: VersionControl) -> String {
         let ignore_items = match vcs {
             VersionControl::Hg => &self.hg_ignore,
+            VersionControl::Fossil => &self.fossil_ignore,
             _ => &self.ignore,
         };
 
@@ -557,20 +602,30 @@ impl IgnoreList {
 
         let ignore_items = match vcs {
             VersionControl::Hg => &self.hg_ignore,
+            VersionControl::Fossil => &self.fossil_ignore,
             _ => &self.ignore,
         };
 
-        let mut out = "\n\n# Added by cargo\n".to_string();
-        if ignore_items
-            .iter()
-            .any(|item| existing_items.contains(item))
-        {
-            out.push_str("#\n# already existing elements were commented out\n");
+        let mut out = String::new();
+
+        // Fossil does not support `#` comments.
+        if vcs != VersionControl::Fossil {
+            out.push_str("\n\n# Added by cargo\n");
+            if ignore_items
+                .iter()
+                .any(|item| existing_items.contains(item))
+            {
+                out.push_str("#\n# already existing elements were commented out\n");
+            }
+            out.push('\n');
         }
-        out.push('\n');
 
         for item in ignore_items {
             if existing_items.contains(item) {
+                if vcs == VersionControl::Fossil {
+                    // Just merge for Fossil.
+                    continue;
+                }
                 out.push('#');
             }
             out.push_str(item);
@@ -584,30 +639,35 @@ impl IgnoreList {
 /// Writes the ignore file to the given directory. If the ignore file for the
 /// given vcs system already exists, its content is read and duplicate ignore
 /// file entries are filtered out.
-fn write_ignore_file(
-    base_path: &Path,
-    list: &IgnoreList,
-    vcs: VersionControl,
-) -> CargoResult<String> {
-    let fp_ignore = match vcs {
-        VersionControl::Git => base_path.join(".gitignore"),
-        VersionControl::Hg => base_path.join(".hgignore"),
-        VersionControl::Pijul => base_path.join(".ignore"),
-        VersionControl::Fossil => return Ok("".to_string()),
-        VersionControl::NoVcs => return Ok("".to_string()),
-    };
+fn write_ignore_file(base_path: &Path, list: &IgnoreList, vcs: VersionControl) -> CargoResult<()> {
+    // Fossil only supports project-level settings in a dedicated subdirectory.
+    if vcs == VersionControl::Fossil {
+        paths::create_dir_all(base_path.join(".fossil-settings"))?;
+    }
 
-    let ignore: String = match paths::open(&fp_ignore) {
-        Err(err) => match err.downcast_ref::<std::io::Error>() {
-            Some(io_err) if io_err.kind() == ErrorKind::NotFound => list.format_new(vcs),
-            _ => return Err(err),
-        },
-        Ok(file) => list.format_existing(BufReader::new(file), vcs),
-    };
+    for fp_ignore in match vcs {
+        VersionControl::Git => vec![base_path.join(".gitignore")],
+        VersionControl::Hg => vec![base_path.join(".hgignore")],
+        VersionControl::Pijul => vec![base_path.join(".ignore")],
+        // Fossil has a cleaning functionality configured in a separate file.
+        VersionControl::Fossil => vec![
+            base_path.join(".fossil-settings/ignore-glob"),
+            base_path.join(".fossil-settings/clean-glob"),
+        ],
+        VersionControl::NoVcs => return Ok(()),
+    } {
+        let ignore: String = match paths::open(&fp_ignore) {
+            Err(err) => match err.downcast_ref::<std::io::Error>() {
+                Some(io_err) if io_err.kind() == ErrorKind::NotFound => list.format_new(vcs),
+                _ => return Err(err),
+            },
+            Ok(file) => list.format_existing(BufReader::new(file), vcs),
+        };
 
-    paths::append(&fp_ignore, ignore.as_bytes())?;
+        paths::append(&fp_ignore, ignore.as_bytes())?;
+    }
 
-    Ok(ignore)
+    Ok(())
 }
 
 /// Initializes the correct VCS system based on the provided config.
@@ -650,12 +710,12 @@ fn mk(config: &Config, opts: &MkOptions<'_>) -> CargoResult<()> {
     let name = opts.name;
     let cfg = config.get::<CargoNewConfig>("cargo-new")?;
 
-    // Using the push method with two arguments ensures that the entries for
-    // both `ignore` and `hgignore` are in sync.
+    // Using the push method with multiple arguments ensures that the entries
+    // for all mutually-incompatible VCS in terms of syntax are in sync.
     let mut ignore = IgnoreList::new();
-    ignore.push("/target", "^target/");
+    ignore.push("/target", "^target/", "target");
     if !opts.bin {
-        ignore.push("Cargo.lock", "glob:Cargo.lock");
+        ignore.push("Cargo.lock", "glob:Cargo.lock", "Cargo.lock,*/Cargo.lock");
     }
 
     let vcs = opts.version_control.unwrap_or_else(|| {
